@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Runnable CLI for the Wikipedia Q&A system."""
 
+import os
 import sys
 import time
 
@@ -89,7 +90,16 @@ def run_eval_mode() -> None:
     print(SEP)
 
 
+def _check_api_key() -> None:
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print("Error: ANTHROPIC_API_KEY is not set.", file=sys.stderr)
+        print("Set it with:", file=sys.stderr)
+        print('  export ANTHROPIC_API_KEY="your-api-key-here"', file=sys.stderr)
+        sys.exit(1)
+
+
 def main() -> None:
+    _check_api_key()
     args = sys.argv[1:]
 
     try:
