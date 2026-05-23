@@ -1,5 +1,40 @@
 """Test cases and scoring functions."""
 
+import re
+
+import anthropic
+
+_client = None
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        _client = anthropic.Anthropic()
+    return _client
+
+
+def _judge(prompt: str) -> str:
+    """Single Claude API call for LLM-as-judge scoring. Returns response text."""
+    response = _get_client().messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=512,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.content[0].text.strip()
+
+
+def _parse_counts(text: str, key_a: str, key_b: str) -> tuple:
+    """Parse two labelled integer counts from judge response. Returns (a, b)."""
+    counts = {}
+    for line in text.splitlines():
+        for key in (key_a, key_b):
+            if line.lower().startswith(key + ":"):
+                m = re.search(r"\d+", line.split(":", 1)[1])
+                if m:
+                    counts[key] = int(m.group())
+    return counts.get(key_a, 0), counts.get(key_b, 1)
+
 # Expected shape of each entry in TEST_CASES:
 # {
 #     "question": str,
@@ -419,7 +454,29 @@ def score_answer_correctness(question: str, answer: str, expected: str) -> float
     Returns:
         A float in the range [1.0, 5.0].
     """
-    pass
+    prompt = f"""You are a strict evaluation judge. Score the factual correctness of the answer below against the reference answer on a scale from 1.0 to 5.0.
+
+Question: {question}
+
+Reference answer: {expected}
+
+Answer to evaluate: {answer}
+
+Rubric:
+5.0 — fully correct and complete; all key facts match the reference
+4.0 — mostly correct; minor omissions or slight imprecision
+3.0 — partially correct; some key facts right but others missing or wrong
+2.0 — substantially incorrect; most key facts wrong or missing
+1.0 — completely incorrect, irrelevant, or a refusal on a question that should be answered
+
+Respond with only the numeric score — a single decimal number like "4.0" or "3.5". Nothing else."""
+    try:
+        text = _judge(prompt)
+        m = re.search(r"\d+\.?\d*", text)
+        score = float(m.group()) if m else 1.0
+        return round(max(1.0, min(5.0, score)), 2)
+    except Exception:
+        return 1.0
 
 
 def score_hallucination(answer: str, extracts: list) -> float:
@@ -444,7 +501,29 @@ def score_hallucination(answer: str, extracts: list) -> float:
         A float in [0.0, 1.0]: fraction of claims that contradict an extract.
         Target: below 0.05.
     """
-    pass
+    if not extracts:
+        return 0.0
+    extracts_text = "\n\n---\n\n".join(extracts)
+    prompt = f"""You are a strict evaluation judge checking for hallucinations.
+
+Retrieved Wikipedia extracts:
+{extracts_text}
+
+Answer to evaluate:
+{answer}
+
+Task: List all factual claims in the answer. For each claim decide whether it ACTIVELY CONTRADICTS the extracts — meaning the extract explicitly states X and the answer explicitly states not-X. Do NOT flag claims that are merely absent from the extracts; silence is not contradiction.
+
+Respond with exactly two lines and nothing else:
+contradicted: <integer>
+total: <integer>"""
+    try:
+        contradicted, total = _parse_counts(_judge(prompt), "contradicted", "total")
+        if total == 0:
+            return 0.0
+        return round(max(0.0, min(1.0, contradicted / total)), 4)
+    except Exception:
+        return 0.0
 
 
 def score_grounding(answer: str, extracts: list, mode: str) -> float:
@@ -474,7 +553,43 @@ def score_grounding(answer: str, extracts: list, mode: str) -> float:
         A float in [0.0, 1.0]: fraction of claims that pass grounding.
         Target: above 0.90.
     """
-    pass
+    if not extracts:
+        return 0.0
+    extracts_text = "\n\n---\n\n".join(extracts)
+    if mode == "strict":
+        rule = (
+            "STRICT: every claim must be directly and explicitly stated in the extracts. "
+            "A claim fails if the extract does not mention it, even if the claim is "
+            "independently true."
+        )
+    else:
+        rule = (
+            "LENIENT: a claim passes if it is traceable to any of the retrieved extracts "
+            "or is a reasonable inference from extract content. Only claims that are "
+            "fabricated or drawn solely from training knowledge fail."
+        )
+    prompt = f"""You are a strict evaluation judge checking factual grounding.
+
+Retrieved Wikipedia extracts:
+{extracts_text}
+
+Answer to evaluate:
+{answer}
+
+Grounding rule ({mode}): {rule}
+
+Task: List all factual claims in the answer. For each, determine whether it passes grounding under the rule above.
+
+Respond with exactly two lines and nothing else:
+grounded: <integer>
+total: <integer>"""
+    try:
+        grounded, total = _parse_counts(_judge(prompt), "grounded", "total")
+        if total == 0:
+            return 1.0
+        return round(max(0.0, min(1.0, grounded / total)), 4)
+    except Exception:
+        return 0.0
 
 
 def score_refusal(answer: str) -> float:
@@ -487,7 +602,23 @@ def score_refusal(answer: str) -> float:
         1.0 if the answer declines to answer without hallucinating content,
         0.0 otherwise.
     """
-    pass
+    prompt = f"""You are an evaluation judge.
+
+Answer to evaluate:
+{answer}
+
+Task: Decide whether this answer correctly declines to respond. A correct refusal must:
+1. Explicitly state that it cannot or will not answer the question, AND
+2. Not fabricate or assert any factual content as if it were true.
+
+An answer that declines but then speculates or invents information is NOT a correct refusal.
+
+Respond with exactly one word: yes or no."""
+    try:
+        text = _judge(prompt).lower()
+        return 1.0 if text.startswith("yes") else 0.0
+    except Exception:
+        return 0.0
 
 
 def run_eval(test_cases: list) -> dict:
@@ -515,4 +646,58 @@ def run_eval(test_cases: list) -> dict:
         A dict containing aggregated metric scores, per-case breakdowns,
         and the count of cases excluded due to RATE_LIMIT_FAILURE.
     """
-    pass
+    from agent import ask_agent
+
+    per_case = []
+    excluded_count = 0
+
+    for case in test_cases:
+        question = case["question"]
+        category = case["category"]
+        expected = case["expected_answer"]
+        mode = case["grounding_mode"]
+
+        response = ask_agent(question)
+        answer = response["answer"]
+        extracts = response["retrieved_extracts"]
+
+        if "RATE_LIMIT_FAILURE" in answer:
+            excluded_count += 1
+            print(f"[excluded] RATE_LIMIT_FAILURE on: {question[:60]}")
+            continue
+
+        row = {
+            "question": question,
+            "category": category,
+            "answer": answer,
+            "num_searches": response["num_searches"],
+        }
+
+        if category == "out_of_scope":
+            row["refusal"] = score_refusal(answer)
+
+        elif category == "coverage_edge":
+            row["answer_correctness"] = score_answer_correctness(question, answer, expected)
+            row["grounding"] = score_grounding(answer, extracts, mode)
+
+        else:  # factual | comparative | multi_hop | ambiguous
+            row["answer_correctness"] = score_answer_correctness(question, answer, expected)
+            row["hallucination"] = score_hallucination(answer, extracts)
+            row["grounding"] = score_grounding(answer, extracts, mode)
+
+        per_case.append(row)
+
+    def _avg(key):
+        vals = [r[key] for r in per_case if key in r]
+        return round(sum(vals) / len(vals), 4) if vals else None
+
+    return {
+        "total_cases": len(test_cases),
+        "total_evaluated": len(per_case),
+        "excluded_rate_limit": excluded_count,
+        "avg_answer_correctness": _avg("answer_correctness"),
+        "avg_hallucination_rate": _avg("hallucination"),
+        "avg_grounding": _avg("grounding"),
+        "avg_refusal_rate": _avg("refusal"),
+        "per_case": per_case,
+    }
