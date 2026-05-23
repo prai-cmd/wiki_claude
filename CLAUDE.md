@@ -51,3 +51,39 @@ Hallucination rate and factual grounding are independent metrics. A claim can be
 The LLM-as-judge evaluator is a direct Claude API call we write ourselves — not a hosted eval framework or third-party eval service like RAGAS, LangSmith, or similar.
 
 The test case set should be stratified across question types: factual lookup (who, what, when, where), explanatory (how does X work), comparative (what is the difference between X and Y), and current-events-adjacent (recent enough that training data may be stale). These test cases are hand-authored or generated directly by us — they are not sourced from a pre-existing benchmark dataset or third-party test suite. Around 50–100 test cases across these categories gives enough signal for iteration without being prohibitively expensive to run. All test cases should have a human-written reference answer and a label indicating whether the answer is findable on Wikipedia, so the suite can separately score "findable" vs. "unfindable" cases — for unfindable questions, the expected behavior is an honest acknowledgment rather than a fabricated answer.
+
+---
+
+## 4. Implementation Learnings
+
+### Agent Architecture
+
+- `tool_choice={"type": "any"}` on the first API call is essential to eliminate memory answers (drove memory_answer_rate from 0.33 → 0.0). Without it, Claude frequently answers from training knowledge.
+- Out-of-scope questions (poems, opinions, predictions) must be detected before applying `tool_choice={"type": "any"}` — forcing tool use on these prevents the model from declining gracefully and tanks refusal rate. Detection is via a keyword list (`poem`, `story`, `joke`, `opinion`, `predict`, `favourite`, `best`, `worst`, `will`, `should i`).
+- A mandatory fallback search after the agentic loop handles cases where the model still skips tool use despite `tool_choice`. Extract a noun phrase from the question, call `search_wikipedia`, then ask Claude to revise its answer citing the new source.
+- Noun-phrase extraction for fallback queries requires regex strip patterns (removing question preamble like "how many", "what is the") plus a stop-word filter. Verbatim question strings perform poorly as Wikipedia queries.
+
+### System Prompt
+
+- Split into two explicit sections: **Retrieval rules** (when/how to search) and **Answer rules** (how to cite and present). Keeping them separate makes it easier to iterate on one without regressing the other.
+- Superlatives (largest, fastest, tallest, most) and comparative questions (X vs Y, difference between X and Y) must be explicitly called out as mandatory search triggers — the model will otherwise answer from memory on these.
+- Disambiguation: instruct the model to never resolve an ambiguous query from memory. Always search first, then state the interpretation. Without this, ambiguous questions (Mercury, Apollo, Genesis) return ungrounded answers.
+- Declining out-of-scope requests must be a separate explicit instruction. If the system prompt only says "when to search", the model may still attempt to answer creative or opinion questions.
+
+### Eval Suite
+
+- 35 test cases across 6 categories: `factual`, `comparative`, `multi_hop`, `ambiguous`, `out_of_scope`, `coverage_edge`.
+- Best run results (as of last full eval):
+  - Answer correctness: 4.7 ✅ (target ≥ 4.0)
+  - Hallucination rate: 0.0 ✅ (target < 0.05)
+  - Grounding: 0.73 ❌ (target > 0.90) — main remaining gap
+  - Refusal rate: 1.0 ✅ (target > 0.90)
+  - Memory answer rate: 0.0 ✅ (target = 0.0)
+- Grounding is the hardest metric to improve: comparative and ambiguous questions require the model to synthesise across multiple concepts, and the grounding scorer marks any claim not present in the retrieved extract as ungrounded — even if the claim is factually correct and well-reasoned.
+- `memory_answer_rate` must be tracked separately per `requires_tool` cases only — out-of-scope cases that correctly decline are not memory answers.
+
+### CLI and Setup
+
+- `main.py` provides three modes: normal (`python main.py "question"`), demo (no args, 3 hardcoded questions), eval (`--eval` flag).
+- Check `ANTHROPIC_API_KEY` at startup before any imports of agent/eval — gives a clear actionable error rather than an SDK-level exception.
+- No API key required for Wikipedia MediaWiki REST API access.
