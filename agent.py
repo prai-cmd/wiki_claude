@@ -1,7 +1,40 @@
 """Claude research assistant agent."""
 
+import re
+
 import anthropic
 from wikipedia import search_wikipedia
+
+_FALLBACK_TRIGGERS = ("how many ", "what is the ", "how does ")
+
+_STRIP_PATTERNS = [
+    (re.compile(r"(?i)^how many\s+(\w[\w\s]*?)\s+(?:are|is|were|was|have|has|exist)\b"), 1),
+    (re.compile(r"(?i)^what is the\s+(.+?)(?:\s+(?:in|on|of|at|for)\s+.+)?$"), 1),
+    (re.compile(r"(?i)^how does\s+(\w[\w\s]*?)\s+(?:differ|work|compare|function)\b"), 1),
+    (re.compile(r"(?i)^how do\s+(\w[\w\s]*?)\s+(?:differ|work|compare)\b"), 1),
+    (re.compile(r"(?i)^tell me about\s+(.+)$"), 1),
+    (re.compile(r"(?i)^who or what (?:is|are)\s+(.+)$"), 1),
+    (re.compile(r"(?i)^what is\s+(.+)$"), 1),
+    (re.compile(r"(?i)^what are\s+(.+)$"), 1),
+]
+
+_STRIP_STOP = {
+    "how", "many", "what", "is", "the", "are", "does", "do",
+    "who", "when", "where", "which", "why", "was", "were", "a", "an",
+}
+
+
+def _fallback_query(question: str) -> str:
+    """Extract the most specific noun phrase from a question for a fallback search."""
+    q = question.strip().rstrip("?.")
+    for pattern, group in _STRIP_PATTERNS:
+        m = pattern.match(q)
+        if m:
+            phrase = m.group(group).strip()
+            return " ".join(phrase.split()[:6])
+    words = q.split()
+    meaningful = [w for w in words if w.lower() not in _STRIP_STOP]
+    return " ".join(meaningful[:5]) if meaningful else " ".join(words[:5])
 
 SYSTEM_PROMPT = """
 ## Section 1 — Retrieval rules
@@ -9,7 +42,7 @@ SYSTEM_PROMPT = """
 You are a research assistant. Your first responsibility is deciding when to search Wikipedia and how to do it well.
 
 **When to search:**
-You must call search_wikipedia before answering any question that involves a specific real-world entity, event, date, statistic, or named person, place, or organisation. This is not optional — answering such questions from memory without calling the tool is not permitted, even if you believe you know the answer.
+You must call search_wikipedia before answering any question that involves a specific real-world entity, event, date, statistic, or named person, place, or organisation. This is not optional — answering such questions from memory without calling the tool is not permitted, even if you believe you know the answer. Questions asking for measurements, counts, or superlatives (largest, fastest, tallest, most) always require a search even if the answer seems like general knowledge. Comparative questions involving two or more named entities, scientific concepts, or biological terms always require at least one search_wikipedia call.
 
 **When not to search:**
 Do not call search_wikipedia for questions about general concepts, definitions of common terms, or logical and mathematical reasoning where no specific real-world entity is involved.
@@ -21,7 +54,7 @@ Do not call search_wikipedia for questions about general concepts, definitions o
 
 **Hard cap:** Make no more than 3 search_wikipedia calls per turn. If 3 calls have been made and the answer is still incomplete, proceed with what has been retrieved and acknowledge any remaining uncertainty.
 
-**Disambiguation:** If the query could match multiple distinct entities (for example, a name shared by a person, a place, and a film), search for the most specific and plausible interpretation given the question context. State your interpretation explicitly in your answer. If you cannot determine the correct interpretation, ask the user to clarify before searching.
+**Disambiguation:** If the query could match multiple distinct entities (for example, a name shared by a person, a place, and a film), search for the most specific and plausible interpretation given the question context. State your interpretation explicitly in your answer. If you cannot determine the correct interpretation, ask the user to clarify before searching. Never resolve an ambiguous query from memory — always search first, then state your interpretation.
 
 ---
 
@@ -105,15 +138,31 @@ def ask_agent(question: str) -> dict:
     num_searches = 0
     retrieved_extracts = []
     answer = ""
+    first_call = True
+
+    _OUT_OF_SCOPE_WORDS = [
+        "poem", "story", "joke", "opinion", "predict",
+        "favourite", "favorite", "best", "worst", "will", "should i",
+    ]
+    q_lower = question.lower()
+    first_call_tool_choice = (
+        {"type": "auto"}
+        if any(w in q_lower for w in _OUT_OF_SCOPE_WORDS)
+        else {"type": "any"}
+    )
 
     while True:
-        response = client.messages.create(
+        kwargs = dict(
             model="claude-sonnet-4-6",
             max_tokens=2048,
             system=SYSTEM_PROMPT,
             tools=TOOLS,
             messages=messages,
         )
+        if first_call:
+            kwargs["tool_choice"] = first_call_tool_choice
+        first_call = False
+        response = client.messages.create(**kwargs)
 
         if response.stop_reason == "end_turn":
             for block in response.content:
@@ -144,6 +193,40 @@ def ask_agent(question: str) -> dict:
             break
 
         messages.append({"role": "user", "content": tool_results})
+
+    # Mandatory fallback: trigger if no searches happened (previous requirement),
+    # or if the question starts with a known high-risk prefix (additional signals).
+    q_lower = question.lower()
+    should_fallback = num_searches == 0 or any(
+        q_lower.startswith(t) for t in _FALLBACK_TRIGGERS
+    )
+    if should_fallback and num_searches == 0:
+        query = _fallback_query(question)
+        extract = search_wikipedia(query)
+        tools_called.append(query)
+        num_searches += 1
+        retrieved_extracts.append(extract)
+
+        # Include the memory answer, then inject the extract and ask Claude to revise.
+        messages.append({"role": "assistant", "content": [{"type": "text", "text": answer}]})
+        messages.append({
+            "role": "user",
+            "content": (
+                f"I retrieved the following Wikipedia article that is relevant to the question. "
+                f"Please revise your answer to ground it in this source and cite it:\n\n{extract}"
+            ),
+        })
+        fallback_response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2048,
+            system=SYSTEM_PROMPT,
+            tools=TOOLS,
+            messages=messages,
+        )
+        for block in fallback_response.content:
+            if hasattr(block, "text"):
+                answer = block.text
+                break
 
     return {
         "answer": answer,

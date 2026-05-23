@@ -666,11 +666,14 @@ def run_eval(test_cases: list) -> dict:
             print(f"[excluded] RATE_LIMIT_FAILURE on: {question[:60]}")
             continue
 
+        requires_tool = case["requires_tool"]
         row = {
             "question": question,
             "category": category,
             "answer": answer,
             "num_searches": response["num_searches"],
+            "requires_tool": requires_tool,
+            "memory_answer": requires_tool and response["num_searches"] == 0,
         }
 
         if category == "out_of_scope":
@@ -691,6 +694,12 @@ def run_eval(test_cases: list) -> dict:
         vals = [r[key] for r in per_case if key in r]
         return round(sum(vals) / len(vals), 4) if vals else None
 
+    tool_required = [r for r in per_case if r["requires_tool"]]
+    memory_answer_rate = (
+        round(sum(1 for r in tool_required if r["memory_answer"]) / len(tool_required), 4)
+        if tool_required else None
+    )
+
     return {
         "total_cases": len(test_cases),
         "total_evaluated": len(per_case),
@@ -699,5 +708,6 @@ def run_eval(test_cases: list) -> dict:
         "avg_hallucination_rate": _avg("hallucination"),
         "avg_grounding": _avg("grounding"),
         "avg_refusal_rate": _avg("refusal"),
+        "memory_answer_rate": memory_answer_rate,
         "per_case": per_case,
     }
